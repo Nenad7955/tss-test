@@ -226,12 +226,12 @@ func partyIDsFromNumbers(parties []uint16) []*tss.PartyID {
 	return tss.SortPartyIDs(partyIDs)
 }
 
-func (p *party) Sign(ctx context.Context, msgHash []byte) ([]byte, error) {
+func (p *party) Sign(ctx context.Context, msgHash []byte) ([]byte, *common.SignatureData, error) {
 	if p.shareData == nil {
-		return nil, fmt.Errorf("must call SetShareData() before attempting to sign")
+		return nil, nil, fmt.Errorf("must call SetShareData() before attempting to sign")
 	}
-	p.logger.Debugf("Starting signing")
-	defer p.logger.Debugf("Finished signing")
+	//p.logger.Debugf("Starting signing")
+	//defer p.logger.Debugf("Finished signing")
 
 	defer close(p.closeChan)
 
@@ -256,10 +256,10 @@ func (p *party) Sign(ctx context.Context, msgHash []byte) ([]byte, error) {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("signing timed out: %w", ctx.Err())
+			return nil, nil, fmt.Errorf("signing timed out: %w", ctx.Err())
 		case sigOut := <-end:
 			if !bytes.Equal(sigOut.M, msgToSign.Bytes()) {
-				return nil, fmt.Errorf("message we requested to sign is %s but actual message signed is %s",
+				return nil, nil, fmt.Errorf("message we requested to sign is %s but actual message signed is %s",
 					base64.StdEncoding.EncodeToString(msgHash),
 					base64.StdEncoding.EncodeToString(sigOut.M))
 			}
@@ -273,16 +273,16 @@ func (p *party) Sign(ctx context.Context, msgHash []byte) ([]byte, error) {
 
 			sigRaw, err := asn1.Marshal(sig)
 			if err != nil {
-				return nil, fmt.Errorf("failed marshaling ECDSA signature: %w", err)
+				return nil, nil, fmt.Errorf("failed marshaling ECDSA signature: %w", err)
 			}
-			return sigRaw, nil
+			return sigRaw, sigOut, nil
 		case msg := <-p.in:
 			raw, routing, err := msg.WireBytes()
 			if err != nil {
 				p.logger.Warnf("Received error when serializing message: %v", err)
 				continue
 			}
-			p.logger.Debugf("%s Got message from %s", p.id.Id, routing.From.Id)
+			//p.logger.Debugf("%s Got message from %s", p.id.Id, routing.From.Id)
 			ok, err := party.UpdateFromBytes(raw, routing.From, routing.IsBroadcast)
 			if !ok {
 				p.logger.Warnf("Received error when updating party: %v", err.Error())
@@ -293,8 +293,8 @@ func (p *party) Sign(ctx context.Context, msgHash []byte) ([]byte, error) {
 }
 
 func (p *party) KeyGen(ctx context.Context) ([]byte, error) {
-	p.logger.Debugf("Starting DKG")
-	defer p.logger.Debugf("Finished DKG")
+	//p.logger.Debugf("Starting DKG")
+	//defer p.logger.Debugf("Finished DKG")
 
 	defer close(p.closeChan)
 
@@ -341,7 +341,7 @@ func (p *party) KeyGen(ctx context.Context) ([]byte, error) {
 				p.logger.Warnf("Received error when serializing message: %v", err)
 				continue
 			}
-			p.logger.Debugf("%s Got message from %s", p.id.Id, routing.From.Id)
+			//p.logger.Debugf("%s Got message from %s", p.id.Id, routing.From.Id)
 			ok, err := party.UpdateFromBytes(raw, routing.From, routing.IsBroadcast)
 			if !ok {
 				p.logger.Warnf("Received error when updating party: %v", err.Error())
@@ -390,6 +390,7 @@ func hashToInt(hash []byte, c elliptic.Curve) *big.Int {
 }
 
 func digest(in []byte) []byte {
+	return in
 	h := sha256.New()
 	h.Write(in)
 	return h.Sum(nil)
