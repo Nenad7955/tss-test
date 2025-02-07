@@ -13,7 +13,6 @@ import (
 	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -282,19 +281,22 @@ func (p *party) Sign(ctx context.Context, msgHash []byte) ([]byte, error) {
 					base64.StdEncoding.EncodeToString(msgHash),
 					base64.StdEncoding.EncodeToString(sigOut.M))
 			}
-			var sig struct {
-				R, S *big.Int
-			}
-			sig.R = big.NewInt(0)
-			sig.S = big.NewInt(0)
-			sig.R.SetBytes(sigOut.R)
-			sig.S.SetBytes(sigOut.S)
 
-			sigRaw, err := asn1.Marshal(sig)
-			if err != nil {
-				return nil, fmt.Errorf("failed marshaling ECDSA signature: %w", err)
-			}
-			return sigRaw, nil
+			// var sig struct {
+			// 	R, S *big.Int
+			// }
+			// sig.R = big.NewInt(0)
+			// sig.S = big.NewInt(0)
+			// sig.R.SetBytes(sigOut.R)
+			// sig.S.SetBytes(sigOut.S)
+
+			// sigRaw, err := asn1.Marshal(sig)
+			// if err != nil {
+			// 	return nil, fmt.Errorf("failed marshaling ECDSA signature: %w", err)
+			// }
+
+			return append(sigOut.GetSignature(), sigOut.GetSignatureRecovery()[0]), nil
+			// return sigOut.GetSignature(), nil
 		case msg := <-p.in:
 			raw, routing, err := msg.WireBytes()
 			if err != nil {
