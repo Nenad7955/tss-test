@@ -26,6 +26,9 @@ import (
 	"github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
 	"github.com/bnb-chain/tss-lib/v2/ecdsa/signing"
 	"github.com/bnb-chain/tss-lib/v2/tss"
+	"github.com/btcsuite/btcd/btcec/v2"
+	s256k1 "github.com/btcsuite/btcd/btcec/v2"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes/any"
 )
@@ -106,14 +109,20 @@ type party struct {
 	in        chan tss.Message
 	shareData *keygen.LocalPartySaveData
 	closeChan chan struct{}
+	curve     elliptic.Curve
 }
 
-func NewParty(id uint16, logger Logger) *party {
+func NewParty(id uint16, curve elliptic.Curve, logger Logger) *party {
+	if curve == nil {
+		curve = s256k1.S256()
+	}
+
 	return &party{
 		logger: logger,
 		id:     tss.NewPartyID(fmt.Sprintf("%d", id), "", big.NewInt(int64(id))),
 		out:    make(chan tss.Message, 1000),
 		in:     make(chan tss.Message, 1000),
+		curve:  curve,
 	}
 }
 
@@ -190,7 +199,17 @@ func (p *party) ThresholdPK() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return x509.MarshalPKIXPublicKey(pk)
+
+	switch p.curve.Params().Name {
+	case string(tss.Secp256k1):
+		xFieldVal, yFieldVal := new(secp256k1.FieldVal), new(secp256k1.FieldVal)
+		xFieldVal.SetByteSlice(pk.X.Bytes())
+		yFieldVal.SetByteSlice(pk.Y.Bytes())
+		btcecPubKey := btcec.NewPublicKey(xFieldVal, yFieldVal)
+		return btcecPubKey.SerializeCompressed(), nil
+	default:
+		return x509.MarshalPKIXPublicKey(pk)
+	}
 }
 
 func (p *party) SetShareData(shareData []byte) error {
@@ -199,9 +218,9 @@ func (p *party) SetShareData(shareData []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed deserializing shares: %w", err)
 	}
-	localSaveData.ECDSAPub.SetCurve(elliptic.P256())
+	localSaveData.ECDSAPub.SetCurve(p.curve)
 	for _, xj := range localSaveData.BigXj {
-		xj.SetCurve(elliptic.P256())
+		xj.SetCurve(p.curve)
 	}
 	p.shareData = &localSaveData
 	return nil
@@ -210,7 +229,7 @@ func (p *party) SetShareData(shareData []byte) error {
 func (p *party) Init(parties []uint16, threshold int, sendMsg func(msg []byte, isBroadcast bool, to uint16)) {
 	partyIDs := partyIDsFromNumbers(parties)
 	ctx := tss.NewPeerContext(partyIDs)
-	p.params = tss.NewParameters(elliptic.P256(), ctx, p.id, len(parties), threshold)
+	p.params = tss.NewParameters(p.curve, ctx, p.id, len(parties), threshold)
 	p.id.Index = p.locatePartyIndex(p.id)
 	p.sendMsg = sendMsg
 	p.closeChan = make(chan struct{})
@@ -226,18 +245,18 @@ func partyIDsFromNumbers(parties []uint16) []*tss.PartyID {
 	return tss.SortPartyIDs(partyIDs)
 }
 
-func (p *party) Sign(ctx context.Context, msgHash []byte) ([]byte, *common.SignatureData, error) {
+func (p *party) Sign(ctx context.Context, msgHash []byte) ([]byte, error) {
 	if p.shareData == nil {
-		return nil, nil, fmt.Errorf("must call SetShareData() before attempting to sign")
+		return nil, fmt.Errorf("must call SetShareData() before attempting to sign")
 	}
-	//p.logger.Debugf("Starting signing")
-	//defer p.logger.Debugf("Finished signing")
+	p.logger.Debugf("Starting signing")
+	defer p.logger.Debugf("Finished signing")
 
 	defer close(p.closeChan)
 
 	end := make(chan *common.SignatureData, 1)
 
-	msgToSign := hashToInt(msgHash, elliptic.P256())
+	msgToSign := hashToInt(msgHash, p.curve)
 	party := signing.NewLocalParty(msgToSign, p.params, *p.shareData, p.out, end)
 
 	var endWG sync.WaitGroup
@@ -256,10 +275,10 @@ func (p *party) Sign(ctx context.Context, msgHash []byte) ([]byte, *common.Signa
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, nil, fmt.Errorf("signing timed out: %w", ctx.Err())
+			return nil, fmt.Errorf("signing timed out: %w", ctx.Err())
 		case sigOut := <-end:
 			if !bytes.Equal(sigOut.M, msgToSign.Bytes()) {
-				return nil, nil, fmt.Errorf("message we requested to sign is %s but actual message signed is %s",
+				return nil, fmt.Errorf("message we requested to sign is %s but actual message signed is %s",
 					base64.StdEncoding.EncodeToString(msgHash),
 					base64.StdEncoding.EncodeToString(sigOut.M))
 			}
@@ -273,16 +292,16 @@ func (p *party) Sign(ctx context.Context, msgHash []byte) ([]byte, *common.Signa
 
 			sigRaw, err := asn1.Marshal(sig)
 			if err != nil {
-				return nil, nil, fmt.Errorf("failed marshaling ECDSA signature: %w", err)
+				return nil, fmt.Errorf("failed marshaling ECDSA signature: %w", err)
 			}
-			return sigRaw, sigOut, nil
+			return sigRaw, nil
 		case msg := <-p.in:
 			raw, routing, err := msg.WireBytes()
 			if err != nil {
 				p.logger.Warnf("Received error when serializing message: %v", err)
 				continue
 			}
-			//p.logger.Debugf("%s Got message from %s", p.id.Id, routing.From.Id)
+			p.logger.Debugf("%s Got message from %s", p.id.Id, routing.From.Id)
 			ok, err := party.UpdateFromBytes(raw, routing.From, routing.IsBroadcast)
 			if !ok {
 				p.logger.Warnf("Received error when updating party: %v", err.Error())
@@ -293,8 +312,8 @@ func (p *party) Sign(ctx context.Context, msgHash []byte) ([]byte, *common.Signa
 }
 
 func (p *party) KeyGen(ctx context.Context) ([]byte, error) {
-	//p.logger.Debugf("Starting DKG")
-	//defer p.logger.Debugf("Finished DKG")
+	p.logger.Debugf("Starting DKG")
+	defer p.logger.Debugf("Finished DKG")
 
 	defer close(p.closeChan)
 
@@ -341,7 +360,7 @@ func (p *party) KeyGen(ctx context.Context) ([]byte, error) {
 				p.logger.Warnf("Received error when serializing message: %v", err)
 				continue
 			}
-			//p.logger.Debugf("%s Got message from %s", p.id.Id, routing.From.Id)
+			p.logger.Debugf("%s Got message from %s", p.id.Id, routing.From.Id)
 			ok, err := party.UpdateFromBytes(raw, routing.From, routing.IsBroadcast)
 			if !ok {
 				p.logger.Warnf("Received error when updating party: %v", err.Error())
@@ -390,7 +409,6 @@ func hashToInt(hash []byte, c elliptic.Curve) *big.Int {
 }
 
 func digest(in []byte) []byte {
-	return in
 	h := sha256.New()
 	h.Write(in)
 	return h.Sum(nil)

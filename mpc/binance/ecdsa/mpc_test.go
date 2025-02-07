@@ -7,12 +7,11 @@ SPDX-License-Identifier: Apache-2.0
 package ecdsa
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"encoding/hex"
 	"fmt"
-	common2 "github.com/bnb-chain/tss-lib/v2/common"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -23,6 +22,10 @@ import (
 	"time"
 
 	"github.com/bnb-chain/tss-lib/v2/tss"
+	"github.com/btcsuite/btcd/btcec/v2"
+	s256k1 "github.com/btcsuite/btcd/btcec/v2"
+	btcecdsa "github.com/btcsuite/btcd/btcec/v2/ecdsa"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 )
@@ -39,7 +42,7 @@ func (parties parties) setShareData(shareData [][]byte) {
 	}
 }
 
-func (parties parties) sign(msg []byte) ([][]byte, *common2.SignatureData, error) {
+func (parties parties) sign(msg []byte) ([][]byte, error) {
 	var lock sync.Mutex
 	var sigs [][]byte
 	var threadSafeError atomic.Value
@@ -47,13 +50,10 @@ func (parties parties) sign(msg []byte) ([][]byte, *common2.SignatureData, error
 	var wg sync.WaitGroup
 	wg.Add(len(parties))
 
-	var sigOut2 *common2.SignatureData
-
 	for _, p := range parties {
 		go func(p *party) {
 			defer wg.Done()
-			sig, sigOut, err := p.Sign(context.Background(), msg)
-			sigOut2 = sigOut
+			sig, err := p.Sign(context.Background(), msg)
 			if err != nil {
 				threadSafeError.Store(err.Error())
 				return
@@ -69,10 +69,10 @@ func (parties parties) sign(msg []byte) ([][]byte, *common2.SignatureData, error
 
 	err := threadSafeError.Load()
 	if err != nil {
-		return nil, nil, fmt.Errorf(err.(string))
+		return nil, fmt.Errorf(err.(string))
 	}
 
-	return sigs, sigOut2, nil
+	return sigs, nil
 }
 
 func (parties parties) keygen() ([][]byte, error) {
@@ -117,106 +117,100 @@ func (parties parties) Mapping() map[string]*tss.PartyID {
 }
 
 func TestTSS(t *testing.T) {
-	pA := NewParty(1, logger("pA", t.Name()))
-	pB := NewParty(2, logger("pB", t.Name()))
-	pC := NewParty(3, logger("pC", t.Name()))
-
-	addr := common.HexToAddress("0x70997970c51812dc3a010c7d01b50e0d17dc79c8")
-	tx := types.NewTx(&types.DynamicFeeTx{
-		//ChainID:    big.NewInt(31337),
-		ChainID:    big.NewInt(1),
-		Nonce:      0,
-		To:         &addr,
-		Gas:        0x5208,
-		GasTipCap:  big.NewInt(0x4de4fb81),
-		GasFeeCap:  big.NewInt(0x4a76c17a4),
-		Value:      big.NewInt(0x100),
-		Data:       []byte{},
-		AccessList: types.AccessList{},
-	})
-
-	hashed := tx.Hash().Bytes()
-	var b bytes.Buffer
-	fmt.Println(tx.EncodeRLP(&b))
-	fmt.Println(hex.EncodeToString(b.Bytes()))
-	fmt.Println(hex.EncodeToString(hashed))
-
-	t.Logf("Created parties")
-
-	parties := parties{pA, pB, pC}
-	parties.init(senders(parties))
-
-	t.Logf("Running DKG")
-
-	t1 := time.Now()
-	shares, err := parties.keygen()
-	assert.NoError(t, err)
-	t.Logf("DKG elapsed %s", time.Since(t1))
-
-	parties.init(senders(parties))
-
-	parties.setShareData(shares)
-	t.Logf("Signing")
-
-	msgToSign := hashed
-
-	t.Logf("Signing message")
-	t1 = time.Now()
-	sigs, sigOut, err := parties.sign(digest(msgToSign))
-	assert.NoError(t, err)
-	t.Logf("Signing completed in %v", time.Since(t1))
-
-	sigSet := make(map[string]struct{})
-	for _, s := range sigs {
-		sigSet[string(s)] = struct{}{}
+	curves := []elliptic.Curve{
+		elliptic.P256(),
+		s256k1.S256(),
 	}
-	assert.Len(t, sigSet, 1)
 
-	pk, err := parties[0].TPubKey()
+	for _, tc := range curves {
+		t.Run(tc.Params().Name, func(t *testing.T) {
+			pA := NewParty(1, tc, logger("pA", t.Name()))
+			pB := NewParty(2, tc, logger("pB", t.Name()))
+			pC := NewParty(3, tc, logger("pC", t.Name()))
 
-	var sig struct {
-		S, R *big.Int
+			t.Logf("Created parties")
+
+			parties := parties{pA, pB, pC}
+			parties.init(senders(parties))
+
+			t.Logf("Running DKG")
+
+			t1 := time.Now()
+			shares, err := parties.keygen()
+			assert.NoError(t, err)
+			t.Logf("DKG elapsed %s", time.Since(t1))
+
+			parties.init(senders(parties))
+
+			parties.setShareData(shares)
+			t.Logf("Signing")
+
+			//msgToSign := []byte("bla bla")
+
+			addr := common.HexToAddress("0x70997970c51812dc3a010c7d01b50e0d17dc79c8")
+			tx := types.NewTx(&types.DynamicFeeTx{
+				//ChainID:    big.NewInt(31337),
+				ChainID:    big.NewInt(1),
+				Nonce:      0,
+				To:         &addr,
+				Gas:        0x5208,
+				GasTipCap:  big.NewInt(0x4de4fb81),
+				GasFeeCap:  big.NewInt(0x4a76c17a4),
+				Value:      big.NewInt(0x100),
+				Data:       []byte{},
+				AccessList: types.AccessList{},
+			})
+
+			msgToSign := tx.Hash().Bytes()
+
+			t.Logf("Signing message")
+			t1 = time.Now()
+			sigs, err := parties.sign(digest(msgToSign))
+			assert.NoError(t, err)
+			t.Logf("Signing completed in %v", time.Since(t1))
+
+			sigSet := make(map[string]struct{})
+			for _, s := range sigs {
+				sigSet[string(s)] = struct{}{}
+			}
+			assert.Len(t, sigSet, 1)
+
+			pk, err := parties[0].TPubKey()
+			assert.NoError(t, err)
+
+			assert.True(t, verifySignature(tc.Params().Name, pk, msgToSign, sigs[0]))
+		})
 	}
-	sig.R = big.NewInt(0)
-	sig.S = big.NewInt(0)
-	sig.R.SetBytes(sigOut.R)
-	sig.S.SetBytes(sigOut.S)
+}
 
-	assert.NoError(t, err)
+func verifySignature(curveName string, pk *ecdsa.PublicKey, msg []byte, sig []byte) bool {
+	switch curveName {
+	case elliptic.P256().Params().Name:
+		return ecdsa.VerifyASN1(pk, digest(msg), sig)
+	case s256k1.S256().Params().Name:
+		// convert pk to s256k1.PublicKey
+		xFieldVal, yFieldVal := new(secp256k1.FieldVal), new(secp256k1.FieldVal)
+		xFieldVal.SetByteSlice(pk.X.Bytes())
+		yFieldVal.SetByteSlice(pk.Y.Bytes())
+		btcecPubKey := btcec.NewPublicKey(xFieldVal, yFieldVal)
 
-	v := sigOut.GetSignatureRecovery()[0]
+		signature, err := btcecdsa.ParseDERSignature(sig)
+		if err != nil {
+			return false
+		}
 
-	assert.True(t, ecdsa.VerifyASN1(pk, digest(msgToSign), sigs[0]))
-	assert.True(t, ecdsa.Verify(pk, hashed, sig.R, sig.S))
-	fmt.Println("t", crypto.ValidateSignatureValues(v, sig.R, sig.S, true))
-	fmt.Println("t", crypto.ValidateSignatureValues(v, sig.R, sig.S, false))
-	pkey, _ := parties[0].ThresholdPK()
-	fmt.Println("x", crypto.VerifySignature(pkey, digest(msgToSign), sigOut.GetSignature()))
-	fmt.Println("x", crypto.VerifySignature(pkey, digest(msgToSign), append(sigOut.GetSignature(), v)))
-	fmt.Println("x", crypto.VerifySignature(pkey, digest(msgToSign)[:], sigOut.GetSignature()))
-	fmt.Println("x", crypto.VerifySignature(pkey, digest(msgToSign)[:], append(sigOut.GetSignature(), v)))
-	fmt.Println("x", crypto.VerifySignature(pkey, digest(msgToSign)[:], sigOut.GetSignature()[:]))
-	fmt.Println("x", crypto.VerifySignature(pkey, digest(msgToSign)[:], append(sigOut.GetSignature(), v)[:]))
-	fmt.Println("x", crypto.VerifySignature(pkey, digest(msgToSign), sigOut.GetSignature()[:]))
-	fmt.Println("x", crypto.VerifySignature(pkey, digest(msgToSign), append(sigOut.GetSignature(), v)[:]))
+		pubBytes := append(pk.X.Bytes(), pk.Y.Bytes()...)
+		pubHex := hex.EncodeToString(pubBytes)
+		asdf := common.BytesToAddress(common.FromHex(pubHex))
+		fmt.Println("Public key in hex:", asdf)
 
-	pubBytes := append(pk.X.Bytes(), pk.Y.Bytes()...)
-	pubHex := hex.EncodeToString(pubBytes)
-	asdf := common.BytesToAddress(common.FromHex(pubHex))
-	fmt.Println("Public key in hex:", asdf)
-	fmt.Println("PK", common.BytesToAddress(pkey))
+		addr, err := crypto.Ecrecover(msg, append(pk.X.Bytes(), append(pk.Y.Bytes(), 0)...))
+		fmt.Println("recover", common.BytesToAddress(addr), err)
 
-	address, err := crypto.Ecrecover(hashed[:], append(sigOut.GetSignature(), v))
-	if err == nil {
-		fmt.Println("Ecrecover:", common.BytesToAddress(address))
+		return signature.Verify(digest(msg), btcecPubKey)
 	}
-	fmt.Println("addr", address)
-	address, err = crypto.Ecrecover(hashed[:], sigOut.GetSignature())
-	fmt.Println("addr", address)
-	address, err = crypto.Ecrecover(hashed, append(sigOut.GetSignature(), v))
-	fmt.Println("addr", address)
-	address, err = crypto.Ecrecover(hashed, sigOut.GetSignature())
-	fmt.Println("addr", address)
+
+	return false
 }
 
 func senders(parties parties) []Sender {
